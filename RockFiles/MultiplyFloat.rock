@@ -1,0 +1,8 @@
+define MultiplyFloat{
+    float a = 2.5;
+    float b = 2.0;
+    stdout a * b;
+    stdout "Done!";
+}
+
+invoke MultiplyFloat;

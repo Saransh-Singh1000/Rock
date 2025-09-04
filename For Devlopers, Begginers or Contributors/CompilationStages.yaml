@@ -1,0 +1,8 @@
+Compilation Stages:
+  -Converts Rock Files in Tokens
+  -Converts Token into Abstract Tree Syntax
+  -Converts Abstract Tree Syntax into Bytecode
+  -Converts Bytecode in x86_64 Assembly
+  -Uses GCC to Compile the Assembly into Binary
+  -Then Again Uses GCC to Link the Binary into a Executable (.EXE)
+  

@@ -1,0 +1,5 @@
+define SimpleStdout{
+    stdout "Hello, From Rock !";
+}
+
+invoke SimpleStdout;

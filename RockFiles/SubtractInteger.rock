@@ -1,0 +1,8 @@
+define SubtractInteger{
+    int a = 60;
+    int b = 30;
+    stdout a - b;
+    stdout "Done!";
+}
+
+invoke SubtractInteger;

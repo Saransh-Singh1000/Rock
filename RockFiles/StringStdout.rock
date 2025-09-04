@@ -1,0 +1,6 @@
+define StringStdout{
+    string Hey = "Hello";
+    stdout Hey;
+}
+
+invoke StringStdout;
