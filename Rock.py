@@ -56,7 +56,7 @@ ERROR_SUGGESTIONS = {
     "invalid_character": "Use only valid characters in the Rock language syntax.",
     "unterminated_string": "Ensure strings are closed with a matching quotation mark.",
     "unexpected_token": "Check the syntax at this position for misplaced or incorrect tokens.",
-    "type_mismatch": "Ensure the variable type (int, float, string) matches the expression type.",
+    "type_mismatch": "Ensure the variable types are compatible or explicitly cast between int and float.",
     "invalid_global_declaration": "Global declarations must be of the form 'global type var = expr;' inside functions or at program level.",
     "duplicate_global": "Global variable names must be unique. Rename or remove the duplicate global variable.",
     "invalid_assignment": "Assignment to undefined variable. Ensure the variable is declared (locally or globally) before assignment.",
@@ -657,20 +657,31 @@ def generate_llvm_ir(program: Program, ll_file: str):
         elif isinstance(expr, BinaryExpr):
             left_val, left_type = process_expr(expr.left, func_name, builder)
             right_val, right_type = process_expr(expr.right, func_name, builder)
-            if left_type != right_type:
-                log_error(f"Type mismatch in binary operation: {left_type} vs {right_type}", None, ERROR_SUGGESTIONS["type_mismatch"])
-                sys.exit(1)
             if expr.op == '/' and isinstance(expr.right, NumberExpr) and expr.right.value == '0':
                 log_error(f"Division by zero in expression", None, ERROR_SUGGESTIONS["division_by_zero"])
                 sys.exit(1)
-            if isinstance(left_type, ir.IntType):
+            
+            # Handle type mismatch by casting to double if one operand is double
+            result_type = left_type
+            if left_type != right_type:
+                if isinstance(left_type, ir.IntType) and isinstance(right_type, ir.DoubleType):
+                    left_val = builder.sitofp(left_val, ir.DoubleType(), name=new_reg())
+                    result_type = ir.DoubleType()
+                elif isinstance(left_type, ir.DoubleType) and isinstance(right_type, ir.IntType):
+                    right_val = builder.sitofp(right_val, ir.DoubleType(), name=new_reg())
+                    result_type = ir.DoubleType()
+                else:
+                    log_error(f"Binary operation not supported between types '{left_type}' and '{right_type}'", None, ERROR_SUGGESTIONS["type_mismatch"])
+                    sys.exit(1)
+            
+            if isinstance(result_type, ir.IntType):
                 op_map = {'+': builder.add, '-': builder.sub, '*': builder.mul, '/': builder.sdiv, '%': builder.srem}
-                return op_map[expr.op](left_val, right_val, name=new_reg()), left_type
-            elif isinstance(left_type, ir.DoubleType):
+                return op_map[expr.op](left_val, right_val, name=new_reg()), result_type
+            elif isinstance(result_type, ir.DoubleType):
                 op_map = {'+': builder.fadd, '-': builder.fsub, '*': builder.fmul, '/': builder.fdiv, '%': builder.frem}
-                return op_map[expr.op](left_val, right_val, name=new_reg()), left_type
+                return op_map[expr.op](left_val, right_val, name=new_reg()), result_type
             else:
-                log_error(f"Binary operation not supported for type '{left_type}'", None, ERROR_SUGGESTIONS["type_mismatch"])
+                log_error(f"Binary operation not supported for type '{result_type}'", None, ERROR_SUGGESTIONS["type_mismatch"])
                 sys.exit(1)
         log_error(f"Invalid expression in function '{func_name}'", None, ERROR_SUGGESTIONS["invalid_expression"])
         sys.exit(1)
@@ -713,8 +724,13 @@ def generate_llvm_ir(program: Program, ll_file: str):
                 if isinstance(stmt, GlobalVarDecl):
                     expr_val, expr_type = process_expr(stmt.expr, func_name, builder)
                     if expr_type != map_rock_to_llvm_type(stmt.type):
-                        log_error(f"Type mismatch in global variable declaration '{stmt.name}'", None, ERROR_SUGGESTIONS["type_mismatch"])
-                        sys.exit(1)
+                        if isinstance(expr_type, ir.IntType) and stmt.type == "float":
+                            expr_val = builder.sitofp(expr_val, ir.DoubleType(), name=new_reg())
+                        elif isinstance(expr_type, ir.DoubleType) and stmt.type == "int":
+                            expr_val = builder.fptosi(expr_val, ir.IntType(64), name=new_reg())
+                        else:
+                            log_error(f"Type mismatch in global variable declaration '{stmt.name}'", None, ERROR_SUGGESTIONS["type_mismatch"])
+                            sys.exit(1)
                     var_type, var_global = context.global_map[stmt.name]
                     builder.store(expr_val, var_global)
                 elif isinstance(stmt, VarDecl):
@@ -723,22 +739,37 @@ def generate_llvm_ir(program: Program, ll_file: str):
                     context.var_map[func_name][stmt.name] = (llvm_type, var_alloca)
                     expr_val, expr_type = process_expr(stmt.expr, func_name, builder)
                     if expr_type != llvm_type:
-                        log_error(f"Type mismatch in variable declaration '{stmt.name}'", None, ERROR_SUGGESTIONS["type_mismatch"])
-                        sys.exit(1)
+                        if isinstance(expr_type, ir.IntType) and stmt.type == "float":
+                            expr_val = builder.sitofp(expr_val, ir.DoubleType(), name=new_reg())
+                        elif isinstance(expr_type, ir.DoubleType) and stmt.type == "int":
+                            expr_val = builder.fptosi(expr_val, ir.IntType(64), name=new_reg())
+                        else:
+                            log_error(f"Type mismatch in variable declaration '{stmt.name}'", None, ERROR_SUGGESTIONS["type_mismatch"])
+                            sys.exit(1)
                     builder.store(expr_val, var_alloca)
                 elif isinstance(stmt, Assignment):
                     expr_val, expr_type = process_expr(stmt.expr, func_name, builder)
                     if stmt.name in context.var_map[func_name]:
                         var_type, var_alloca = context.var_map[func_name][stmt.name]
                         if expr_type != var_type:
-                            log_error(f"Type mismatch in assignment to local '{stmt.name}'", None, ERROR_SUGGESTIONS["type_mismatch"])
-                            sys.exit(1)
+                            if isinstance(expr_type, ir.IntType) and var_type == ir.DoubleType():
+                                expr_val = builder.sitofp(expr_val, ir.DoubleType(), name=new_reg())
+                            elif isinstance(expr_type, ir.DoubleType) and var_type == ir.IntType(64):
+                                expr_val = builder.fptosi(expr_val, ir.IntType(64), name=new_reg())
+                            else:
+                                log_error(f"Type mismatch in assignment to local '{stmt.name}'", None, ERROR_SUGGESTIONS["type_mismatch"])
+                                sys.exit(1)
                         builder.store(expr_val, var_alloca)
                     elif stmt.name in context.global_map:
                         var_type, var_global = context.global_map[stmt.name]
                         if expr_type != var_type:
-                            log_error(f"Type mismatch in assignment to global '{stmt.name}'", None, ERROR_SUGGESTIONS["type_mismatch"])
-                            sys.exit(1)
+                            if isinstance(expr_type, ir.IntType) and var_type == ir.DoubleType():
+                                expr_val = builder.sitofp(expr_val, ir.DoubleType(), name=new_reg())
+                            elif isinstance(expr_type, ir.DoubleType) and var_type == ir.IntType(64):
+                                expr_val = builder.fptosi(expr_val, ir.IntType(64), name=new_reg())
+                            else:
+                                log_error(f"Type mismatch in assignment to global '{stmt.name}'", None, ERROR_SUGGESTIONS["type_mismatch"])
+                                sys.exit(1)
                         builder.store(expr_val, var_global)
                     else:
                         log_error(f"Assignment to undefined variable '{stmt.name}'", None, ERROR_SUGGESTIONS["invalid_assignment"])
