@@ -17,8 +17,8 @@ print(" " * Padding + f"[blue]{Text}[/blue]")
 print(f"[green]{'_' * Size.columns}[/green]")
 
 # Compiler path
-CLANG_PATH = "LLVM\\LLVM\\bin\\clang.exe"  # Ensure clang is in PATH
-GCC_PATH = "C:\\mingw64\\mingw64\\bin\\gcc.exe"  # Adjusted to match your environment
+CLANG_PATH = "LLVM\\LLVM\\bin\\clang.exe"
+GCC_PATH = "C:\\mingw64\\mingw64\\bin\\gcc.exe"
 
 # ----------------- MESSAGE FORMATTING -----------------
 def log_info(message: str) -> None:
@@ -50,8 +50,8 @@ ERROR_SUGGESTIONS = {
     "invalid_variable_definition": "Use correct variable syntax, e.g., 'int var = expression;'.",
     "undefined_variable": "Declare the variable before using it, e.g., 'int var = value;' or 'global type var = value;'.",
     "division_by_zero": "The denominator in a division cannot be zero. Add a check to avoid this.",
-    "unsupported_command": "Use only valid Rock language commands (int, float, string, final, stdout, global, etc.).",
-    "missing_closing_brace": "Add a closing '}' to complete the function definition.",
+    "unsupported_command": "Use only valid Rock language commands (int, float, string, final, stdout, global, until, etc.).",
+    "missing_closing_brace": "Add a closing '}' to complete the function or loop definition.",
     "invalid_expression": "Check the expression for correct syntax and valid variable names.",
     "invalid_character": "Use only valid characters in the Rock language syntax.",
     "unterminated_string": "Ensure strings are closed with a matching quotation mark.",
@@ -63,10 +63,18 @@ ERROR_SUGGESTIONS = {
     "invalid_global_initializer": "Global variables must be initialized with a valid expression.",
     "immutable_assignment": "Cannot assign to a final variable as it is immutable.",
     "invalid_final_initializer": "Final variables must be initialized with an int or float variable or literal.",
-    "stdout_type_error": "Stdout can only print string or final variables. Wrap int or float in a final variable."
+    "stdout_type_error": "Stdout can only print string literals or final variables. Wrap int or float in a final variable.",
+    "invalid_until_condition": "Until loop condition must be an integer variable or expression.",
+    "stdout_parentheses_error": "Stdout expressions must not be enclosed in parentheses. Use 'stdout \"string\";' or 'stdout var;'."
 }
 
 # ----------------- TOKENIZATION -----------------
+@dataclass
+class Token:
+    type: 'TokenType'
+    value: str
+    line: int
+
 class TokenType(Enum):
     DEFINE = "DEFINE"
     GLOBAL = "GLOBAL"
@@ -92,12 +100,7 @@ class TokenType(Enum):
     RPAREN = "RPAREN"
     SEMICOLON = "SEMICOLON"
     COMMA = "COMMA"
-
-@dataclass
-class Token:
-    type: TokenType
-    value: str
-    line: int
+    UNTIL = "UNTIL"
 
 def tokenize(rock_file: str) -> List[Token]:
     log_info(f"Starting tokenization of {rock_file}")
@@ -144,6 +147,8 @@ def tokenize(rock_file: str) -> List[Token]:
                     tokens.append(Token(TokenType.STRING, identifier, lineno))
                 elif identifier == "stdout":
                     tokens.append(Token(TokenType.STDOUT, identifier, lineno))
+                elif identifier == "until":
+                    tokens.append(Token(TokenType.UNTIL, identifier, lineno))
                 else:
                     tokens.append(Token(TokenType.IDENTIFIER, identifier, lineno))
                 continue
@@ -151,8 +156,20 @@ def tokenize(rock_file: str) -> List[Token]:
                 string = ""
                 pos += 1
                 while pos < len(line) and line[pos] != '"':
-                    string += line[pos]
-                    pos += 1
+                    if line[pos] == '\\' and pos + 1 < len(line):
+                        next_char = line[pos + 1]
+                        if next_char == 'n':
+                            string += '\n'
+                            pos += 2
+                        elif next_char == 't':
+                            string += '\t'
+                            pos += 2
+                        else:
+                            log_error(f"Invalid escape sequence '\\{next_char}' in string literal", lineno, ERROR_SUGGESTIONS["invalid_character"])
+                            return []
+                    else:
+                        string += line[pos]
+                        pos += 1
                 if pos >= len(line):
                     log_error("Unterminated string literal", lineno, ERROR_SUGGESTIONS["unterminated_string"])
                     return []
@@ -215,9 +232,9 @@ class ASTNode:
 
 @dataclass
 class Program(ASTNode):
-    globals: Dict[str, Tuple[str, 'Expression', bool]]  # name -> (type, initializer, is_final)
+    globals: Dict[str, Tuple[str, 'Expression', bool]]
     functions: Dict[str, 'Function']
-    invoke: List[str]  # List to support multiple invokes
+    invoke: List[str]
 
 @dataclass
 class Function(ASTNode):
@@ -250,6 +267,11 @@ class Stdout(ASTNode):
 @dataclass
 class Call(ASTNode):
     func_name: str
+
+@dataclass
+class UntilLoop(ASTNode):
+    condition: 'Expression'
+    body: List[ASTNode]
 
 @dataclass
 class Expression(ASTNode):
@@ -292,8 +314,12 @@ def parse(tokens: List[Token]) -> Program:
         valid = False
         return None
 
-    def parse_expression() -> Expression:
+    def parse_expression(no_parens: bool = False) -> Expression:
         nonlocal pos, valid
+        if no_parens and pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
+            log_error("Parentheses not allowed in this expression", tokens[pos].line, ERROR_SUGGESTIONS["stdout_parentheses_error"])
+            valid = False
+            return None
 
         def parse_primary() -> Expression:
             nonlocal pos, valid
@@ -313,7 +339,7 @@ def parse(tokens: List[Token]) -> Program:
                 return StringExpr(token.value)
             elif token.type == TokenType.IDENTIFIER:
                 return VarExpr(token.value)
-            elif token.type == TokenType.LPAREN:
+            elif token.type == TokenType.LPAREN and not no_parens:
                 expr = parse_additive()
                 if not expr:
                     return None
@@ -425,6 +451,199 @@ def parse(tokens: List[Token]) -> Program:
         if is_function_scope:
             body.append(GlobalVarDecl(var_name, var_type, expr, is_final))
 
+    def parse_body(func_name: str, body: List[ASTNode], variables: Dict[str, Tuple[str, bool]]) -> None:
+        nonlocal pos, valid
+        while pos < len(tokens) and tokens[pos].type != TokenType.RBRACE:
+            if tokens[pos].type == TokenType.GLOBAL:
+                parse_global(is_function_scope=True, func_name=func_name, body=body, variables=variables)
+                continue
+            elif tokens[pos].type in (TokenType.INT, TokenType.FLOAT, TokenType.STRING, TokenType.FINAL):
+                is_final = tokens[pos].type == TokenType.FINAL
+                if is_final:
+                    pos += 1
+                    var_type = "final"
+                else:
+                    var_type = tokens[pos].type.value.lower()
+                    pos += 1
+                var_token = consume(TokenType.IDENTIFIER)
+                if not var_token:
+                    continue
+                var_name = var_token.value
+                if var_name in variables:
+                    log_error(f"Local variable '{var_name}' is defined more than once in function '{func_name}'", var_token.line, ERROR_SUGGESTIONS["duplicate_variable"])
+                    valid = False
+                    continue
+                if not consume(TokenType.EQUALS):
+                    continue
+                expr = parse_expression()
+                if not expr:
+                    continue
+                if is_final:
+                    if not (isinstance(expr, VarExpr) or isinstance(expr, NumberExpr)):
+                        log_error(f"Final variable '{var_name}' must be initialized with an int or float variable or literal", var_token.line, ERROR_SUGGESTIONS["invalid_final_initializer"])
+                        valid = False
+                        continue
+                    if isinstance(expr, VarExpr):
+                        expr_type = variables.get(expr.name, (None, None))[0] or globals.get(expr.name, (None, None, None))[0]
+                        if expr_type not in ("int", "float"):
+                            log_error(f"Final variable '{var_name}' must be initialized with an int or float variable", var_token.line, ERROR_SUGGESTIONS["invalid_final_initializer"])
+                            valid = False
+                            continue
+                        var_type = expr_type
+                    elif isinstance(expr, NumberExpr):
+                        var_type = "int" if expr.type == "i64" else "float"
+                else:
+                    if var_type == "int" and isinstance(expr, NumberExpr) and expr.type != "i64":
+                        log_error(f"Type mismatch: Expected int for variable '{var_name}', got {expr.type}", var_token.line, ERROR_SUGGESTIONS["type_mismatch"])
+                        valid = False
+                    elif var_type == "float" and isinstance(expr, NumberExpr) and expr.type != "double":
+                        log_error(f"Type mismatch: Expected float for variable '{var_name}', got {expr.type}", var_token.line, ERROR_SUGGESTIONS["type_mismatch"])
+                        valid = False
+                    elif var_type == "string" and not isinstance(expr, StringExpr):
+                        log_error(f"Type mismatch: Expected string for variable '{var_name}'", var_token.line, ERROR_SUGGESTIONS["type_mismatch"])
+                        valid = False
+                    elif isinstance(expr, VarExpr) and expr.name not in variables and expr.name not in globals:
+                        log_error(f"Variable '{expr.name}' used before declaration in function '{func_name}'", var_token.line, ERROR_SUGGESTIONS["undefined_variable"])
+                        valid = False
+                    elif isinstance(expr, BinaryExpr):
+                        if isinstance(expr.left, VarExpr) and expr.left.name not in variables and expr.left.name not in globals:
+                            log_error(f"Variable '{expr.left.name}' used before declaration in function '{func_name}'", var_token.line, ERROR_SUGGESTIONS["undefined_variable"])
+                            valid = False
+                        if isinstance(expr.right, VarExpr) and expr.right.name not in variables and expr.right.name not in globals:
+                            log_error(f"Variable '{expr.right.name}' used before declaration in function '{func_name}'", var_token.line, ERROR_SUGGESTIONS["undefined_variable"])
+                            valid = False
+                        if expr.op == '/' and isinstance(expr.right, NumberExpr) and expr.right.value == '0':
+                            log_error(f"Division by zero detected in expression", var_token.line, ERROR_SUGGESTIONS["division_by_zero"])
+                            valid = False
+                variables[var_name] = (var_type, is_final)
+                body.append(VarDecl(var_name, var_type, expr, is_final))
+                if not consume(TokenType.SEMICOLON):
+                    continue
+            elif tokens[pos].type == TokenType.IDENTIFIER and pos + 1 < len(tokens) and tokens[pos + 1].type == TokenType.EQUALS:
+                assign_token = tokens[pos]
+                pos += 2
+                var_name = assign_token.value
+                expr = parse_expression()
+                if not expr:
+                    continue
+                var_type, is_final = variables.get(var_name, (None, None)) or globals.get(var_name, (None, None, None))[:2]
+                if not var_type:
+                    log_error(f"Assignment to undefined variable '{var_name}' in function '{func_name}'", assign_token.line, ERROR_SUGGESTIONS["invalid_assignment"])
+                    valid = False
+                    continue
+                if is_final:
+                    log_error(f"Cannot assign to final variable '{var_name}' in function '{func_name}'", assign_token.line, ERROR_SUGGESTIONS["immutable_assignment"])
+                    valid = False
+                    continue
+                if var_type == "int" and isinstance(expr, NumberExpr) and expr.type != "i64":
+                    log_error(f"Type mismatch: Expected int for assignment to '{var_name}', got {expr.type}", assign_token.line, ERROR_SUGGESTIONS["type_mismatch"])
+                    valid = False
+                elif var_type == "float" and isinstance(expr, NumberExpr) and expr.type != "double":
+                    log_error(f"Type mismatch: Expected float for assignment to '{var_name}', got {expr.type}", assign_token.line, ERROR_SUGGESTIONS["type_mismatch"])
+                    valid = False
+                elif var_type == "string" and not isinstance(expr, StringExpr):
+                    log_error(f"Type mismatch: Expected string for assignment to '{var_name}'", assign_token.line, ERROR_SUGGESTIONS["type_mismatch"])
+                    valid = False
+                elif isinstance(expr, VarExpr) and expr.name not in variables and expr.name not in globals:
+                    log_error(f"Variable '{expr.name}' used before declaration in function '{func_name}'", assign_token.line, ERROR_SUGGESTIONS["undefined_variable"])
+                    valid = False
+                elif isinstance(expr, BinaryExpr):
+                    if isinstance(expr.left, VarExpr) and expr.left.name not in variables and expr.left.name not in globals:
+                        log_error(f"Variable '{expr.left.name}' used before declaration in function '{func_name}'", assign_token.line, ERROR_SUGGESTIONS["undefined_variable"])
+                        valid = False
+                    if isinstance(expr.right, VarExpr) and expr.right.name not in variables and expr.right.name not in globals:
+                        log_error(f"Variable '{expr.right.name}' used before declaration in function '{func_name}'", assign_token.line, ERROR_SUGGESTIONS["undefined_variable"])
+                        valid = False
+                    if expr.op == '/' and isinstance(expr.right, NumberExpr) and expr.right.value == '0':
+                        log_error(f"Division by zero detected in expression", assign_token.line, ERROR_SUGGESTIONS["division_by_zero"])
+                        valid = False
+                body.append(Assignment(var_name, expr))
+                if not consume(TokenType.SEMICOLON):
+                    continue
+            elif tokens[pos].type == TokenType.STDOUT:
+                pos += 1
+                if pos < len(tokens) and tokens[pos].type == TokenType.STRING_LIT:
+                    expr = StringExpr(tokens[pos].value)
+                    pos += 1
+                    body.append(Stdout(expr))
+                    if not consume(TokenType.SEMICOLON):
+                        continue
+                elif pos < len(tokens) and tokens[pos].type == TokenType.IDENTIFIER:
+                    expr = VarExpr(tokens[pos].value)
+                    pos += 1
+                    var_type, is_final = variables.get(expr.name, (None, None)) or globals.get(expr.name, (None, None, None))[:2]
+                    if var_type in ("int", "float") and not is_final:
+                        log_error(f"Stdout can't print int or float directly in function '{func_name}'", tokens[pos-1].line, ERROR_SUGGESTIONS["stdout_type_error"])
+                        valid = False
+                        continue
+                    if var_type is None and expr.name not in variables and expr.name not in globals:
+                        log_error(f"Variable '{expr.name}' used before declaration in function '{func_name}'", tokens[pos-1].line, ERROR_SUGGESTIONS["undefined_variable"])
+                        valid = False
+                        continue
+                    body.append(Stdout(expr))
+                    if not consume(TokenType.SEMICOLON):
+                        continue
+                else:
+                    log_error(f"Invalid stdout expression in function '{func_name}'", tokens[pos-1].line, ERROR_SUGGESTIONS["stdout_type_error"])
+                    valid = False
+                    continue
+            elif tokens[pos].type == TokenType.IDENTIFIER and pos + 1 < len(tokens) and tokens[pos + 1].type == TokenType.LPAREN:
+                func_name_call = tokens[pos].value
+                pos += 2
+                if not consume(TokenType.RPAREN):
+                    continue
+                if func_name_call not in functions and func_name_call != func_name:
+                    log_error(f"Calling undefined function '{func_name_call}' in function '{func_name}'", tokens[pos-2].line, ERROR_SUGGESTIONS["invoking_undefined_function"])
+                    valid = False
+                body.append(Call(func_name_call))
+                if not consume(TokenType.SEMICOLON):
+                    continue
+            elif tokens[pos].type == TokenType.UNTIL:
+                pos += 1
+                if not consume(TokenType.LPAREN):
+                    continue
+                condition = parse_expression()
+                if not condition:
+                    continue
+                if not consume(TokenType.RPAREN):
+                    continue
+                if not consume(TokenType.LBRACE):
+                    continue
+                loop_body = []
+                loop_variables = variables.copy()
+                parse_body(func_name, loop_body, loop_variables)
+                if not consume(TokenType.RBRACE):
+                    log_error(f"Missing closing brace '}}' for until loop in function '{func_name}'", tokens[pos-1].line if pos > 0 else None, ERROR_SUGGESTIONS["missing_closing_brace"])
+                    valid = False
+                    continue
+                # Validate that condition is an integer
+                if isinstance(condition, VarExpr):
+                    var_type = variables.get(condition.name, (None, None))[0] or globals.get(condition.name, (None, None, None))[0]
+                    if var_type != "int":
+                        log_error(f"Until loop condition must be an integer, got '{var_type}' for '{condition.name}'", tokens[pos-1].line, ERROR_SUGGESTIONS["invalid_until_condition"])
+                        valid = False
+                elif isinstance(condition, NumberExpr) and condition.type != "i64":
+                    log_error(f"Until loop condition must be an integer, got '{condition.type}'", tokens[pos-1].line, ERROR_SUGGESTIONS["invalid_until_condition"])
+                    valid = False
+                elif isinstance(condition, BinaryExpr):
+                    if isinstance(condition.left, VarExpr) and condition.left.name not in variables and condition.left.name not in globals:
+                        log_error(f"Variable '{condition.left.name}' used before declaration in function '{func_name}'", tokens[pos-1].line, ERROR_SUGGESTIONS["undefined_variable"])
+                        valid = False
+                    if isinstance(condition.right, VarExpr) and condition.right.name not in variables and condition.right.name not in globals:
+                        log_error(f"Variable '{condition.right.name}' used before declaration in function '{func_name}'", tokens[pos-1].line, ERROR_SUGGESTIONS["undefined_variable"])
+                        valid = False
+                    if not (isinstance(condition.left, (VarExpr, NumberExpr)) and isinstance(condition.right, (VarExpr, NumberExpr))):
+                        log_error(f"Until loop condition must be an integer expression", tokens[pos-1].line, ERROR_SUGGESTIONS["invalid_until_condition"])
+                        valid = False
+                else:
+                    log_error(f"Until loop condition must be an integer expression", tokens[pos-1].line, ERROR_SUGGESTIONS["invalid_until_condition"])
+                    valid = False
+                body.append(UntilLoop(condition, loop_body))
+            else:
+                log_error(f"Unsupported command or syntax error", tokens[pos].line, ERROR_SUGGESTIONS["unsupported_command"])
+                valid = False
+                pos += 1
+
     while pos < len(tokens):
         token = tokens[pos]
         if token.type == TokenType.GLOBAL:
@@ -444,167 +663,7 @@ def parse(tokens: List[Token]) -> Program:
                 continue
             body = []
             variables = {}
-            while pos < len(tokens) and tokens[pos].type != TokenType.RBRACE:
-                if tokens[pos].type == TokenType.GLOBAL:
-                    parse_global(is_function_scope=True, func_name=func_name, body=body, variables=variables)
-                    continue
-                elif tokens[pos].type in (TokenType.INT, TokenType.FLOAT, TokenType.STRING, TokenType.FINAL):
-                    is_final = tokens[pos].type == TokenType.FINAL
-                    if is_final:
-                        pos += 1
-                        var_type = "final"
-                    else:
-                        var_type = tokens[pos].type.value.lower()
-                        pos += 1
-                    var_token = consume(TokenType.IDENTIFIER)
-                    if not var_token:
-                        continue
-                    var_name = var_token.value
-                    if var_name in variables:
-                        log_error(f"Local variable '{var_name}' is defined more than once in function '{func_name}'", var_token.line, ERROR_SUGGESTIONS["duplicate_variable"])
-                        valid = False
-                        continue
-                    if not consume(TokenType.EQUALS):
-                        continue
-                    expr = parse_expression()
-                    if not expr:
-                        continue
-                    if is_final:
-                        if not (isinstance(expr, VarExpr) or isinstance(expr, NumberExpr)):
-                            log_error(f"Final variable '{var_name}' must be initialized with an int or float variable or literal", var_token.line, ERROR_SUGGESTIONS["invalid_final_initializer"])
-                            valid = False
-                            continue
-                        if isinstance(expr, VarExpr):
-                            expr_type = variables.get(expr.name, (None, None))[0] or globals.get(expr.name, (None, None, None))[0]
-                            if expr_type not in ("int", "float"):
-                                log_error(f"Final variable '{var_name}' must be initialized with an int or float variable", var_token.line, ERROR_SUGGESTIONS["invalid_final_initializer"])
-                                valid = False
-                                continue
-                            var_type = expr_type
-                        elif isinstance(expr, NumberExpr):
-                            var_type = "int" if expr.type == "i64" else "float"
-                    else:
-                        if var_type == "int" and isinstance(expr, NumberExpr) and expr.type != "i64":
-                            log_error(f"Type mismatch: Expected int for variable '{var_name}', got {expr.type}", var_token.line, ERROR_SUGGESTIONS["type_mismatch"])
-                            valid = False
-                        elif var_type == "float" and isinstance(expr, NumberExpr) and expr.type != "double":
-                            log_error(f"Type mismatch: Expected float for variable '{var_name}', got {expr.type}", var_token.line, ERROR_SUGGESTIONS["type_mismatch"])
-                            valid = False
-                        elif var_type == "string" and not isinstance(expr, StringExpr):
-                            log_error(f"Type mismatch: Expected string for variable '{var_name}'", var_token.line, ERROR_SUGGESTIONS["type_mismatch"])
-                            valid = False
-                        elif isinstance(expr, VarExpr) and expr.name not in variables and expr.name not in globals:
-                            log_error(f"Variable '{expr.name}' used before declaration in function '{func_name}'", var_token.line, ERROR_SUGGESTIONS["undefined_variable"])
-                            valid = False
-                        elif isinstance(expr, BinaryExpr):
-                            if isinstance(expr.left, VarExpr) and expr.left.name not in variables and expr.left.name not in globals:
-                                log_error(f"Variable '{expr.left.name}' used before declaration in function '{func_name}'", var_token.line, ERROR_SUGGESTIONS["undefined_variable"])
-                                valid = False
-                            if isinstance(expr.right, VarExpr) and expr.right.name not in variables and expr.right.name not in globals:
-                                log_error(f"Variable '{expr.right.name}' used before declaration in function '{func_name}'", var_token.line, ERROR_SUGGESTIONS["undefined_variable"])
-                                valid = False
-                            if expr.op == '/' and isinstance(expr.right, NumberExpr) and expr.right.value == '0':
-                                log_error(f"Division by zero detected in expression", var_token.line, ERROR_SUGGESTIONS["division_by_zero"])
-                                valid = False
-                    variables[var_name] = (var_type, is_final)
-                    body.append(VarDecl(var_name, var_type, expr, is_final))
-                    if not consume(TokenType.SEMICOLON):
-                        continue
-                elif tokens[pos].type == TokenType.IDENTIFIER and pos + 1 < len(tokens) and tokens[pos + 1].type == TokenType.EQUALS:
-                    assign_token = tokens[pos]
-                    pos += 2
-                    var_name = assign_token.value
-                    expr = parse_expression()
-                    if not expr:
-                        continue
-                    var_type, is_final = variables.get(var_name, (None, None)) or globals.get(var_name, (None, None, None))[:2]
-                    if not var_type:
-                        log_error(f"Assignment to undefined variable '{var_name}' in function '{func_name}'", assign_token.line, ERROR_SUGGESTIONS["invalid_assignment"])
-                        valid = False
-                        continue
-                    if is_final:
-                        log_error(f"Cannot assign to final variable '{var_name}' in function '{func_name}'", assign_token.line, ERROR_SUGGESTIONS["immutable_assignment"])
-                        valid = False
-                        continue
-                    if var_type == "int" and isinstance(expr, NumberExpr) and expr.type != "i64":
-                        log_error(f"Type mismatch: Expected int for assignment to '{var_name}', got {expr.type}", assign_token.line, ERROR_SUGGESTIONS["type_mismatch"])
-                        valid = False
-                    elif var_type == "float" and isinstance(expr, NumberExpr) and expr.type != "double":
-                        log_error(f"Type mismatch: Expected float for assignment to '{var_name}', got {expr.type}", assign_token.line, ERROR_SUGGESTIONS["type_mismatch"])
-                        valid = False
-                    elif var_type == "string" and not isinstance(expr, StringExpr):
-                        log_error(f"Type mismatch: Expected string for assignment to '{var_name}'", assign_token.line, ERROR_SUGGESTIONS["type_mismatch"])
-                        valid = False
-                    elif isinstance(expr, VarExpr) and expr.name not in variables and expr.name not in globals:
-                        log_error(f"Variable '{expr.name}' used before declaration in function '{func_name}'", assign_token.line, ERROR_SUGGESTIONS["undefined_variable"])
-                        valid = False
-                    elif isinstance(expr, BinaryExpr):
-                        if isinstance(expr.left, VarExpr) and expr.left.name not in variables and expr.left.name not in globals:
-                            log_error(f"Variable '{expr.left.name}' used before declaration in function '{func_name}'", assign_token.line, ERROR_SUGGESTIONS["undefined_variable"])
-                            valid = False
-                        if isinstance(expr.right, VarExpr) and expr.right.name not in variables and expr.right.name not in globals:
-                            log_error(f"Variable '{expr.right.name}' used before declaration in function '{func_name}'", assign_token.line, ERROR_SUGGESTIONS["undefined_variable"])
-                            valid = False
-                        if expr.op == '/' and isinstance(expr.right, NumberExpr) and expr.right.value == '0':
-                            log_error(f"Division by zero detected in expression", assign_token.line, ERROR_SUGGESTIONS["division_by_zero"])
-                            valid = False
-                    body.append(Assignment(var_name, expr))
-                    if not consume(TokenType.SEMICOLON):
-                        continue
-                elif tokens[pos].type == TokenType.STDOUT:
-                    pos += 1
-                    if pos < len(tokens) and tokens[pos].type == TokenType.STRING_LIT:
-                        expr = StringExpr(tokens[pos].value)
-                        pos += 1
-                        body.append(Stdout(expr))
-                        if not consume(TokenType.SEMICOLON):
-                            continue
-                    else:
-                        expr = parse_expression()
-                        if not expr:
-                            continue
-                        if isinstance(expr, VarExpr):
-                            var_type, is_final = variables.get(expr.name, (None, None)) or globals.get(expr.name, (None, None, None))[:2]
-                            if var_type in ("int", "float") and not is_final:
-                                log_error(f"Stdout can't print int or float directly in function '{func_name}'", tokens[pos-1].line, ERROR_SUGGESTIONS["stdout_type_error"])
-                                valid = False
-                                continue
-                            if var_type is None and expr.name not in variables and expr.name not in globals:
-                                log_error(f"Variable '{expr.name}' used before declaration in function '{func_name}'", tokens[pos-1].line, ERROR_SUGGESTIONS["undefined_variable"])
-                                valid = False
-                                continue
-                        elif isinstance(expr, NumberExpr):
-                            log_error(f"Stdout can't print int or float literals directly in function '{func_name}'", tokens[pos-1].line, ERROR_SUGGESTIONS["stdout_type_error"])
-                            valid = False
-                            continue
-                        elif isinstance(expr, BinaryExpr):
-                            if isinstance(expr.left, VarExpr) and expr.left.name not in variables and expr.left.name not in globals:
-                                log_error(f"Variable '{expr.left.name}' used before declaration in function '{func_name}'", tokens[pos-1].line, ERROR_SUGGESTIONS["undefined_variable"])
-                                valid = False
-                            if isinstance(expr.right, VarExpr) and expr.right.name not in variables and expr.right.name not in globals:
-                                log_error(f"Variable '{expr.right.name}' used before declaration in function '{func_name}'", tokens[pos-1].line, ERROR_SUGGESTIONS["undefined_variable"])
-                                valid = False
-                            if expr.op == '/' and isinstance(expr.right, NumberExpr) and expr.right.value == '0':
-                                log_error(f"Division by zero detected in expression", tokens[pos-1].line, ERROR_SUGGESTIONS["division_by_zero"])
-                                valid = False
-                        body.append(Stdout(expr))
-                        if not consume(TokenType.SEMICOLON):
-                            continue
-                elif tokens[pos].type == TokenType.IDENTIFIER and pos + 1 < len(tokens) and tokens[pos + 1].type == TokenType.LPAREN:
-                    func_name_call = tokens[pos].value
-                    pos += 2
-                    if not consume(TokenType.RPAREN):
-                        continue
-                    if func_name_call not in functions and func_name_call != func_name:
-                        log_error(f"Calling undefined function '{func_name_call}' in function '{func_name}'", tokens[pos-2].line, ERROR_SUGGESTIONS["invoking_undefined_function"])
-                        valid = False
-                    body.append(Call(func_name_call))
-                    if not consume(TokenType.SEMICOLON):
-                        continue
-                else:
-                    log_error(f"Unsupported command or syntax error", tokens[pos].line, ERROR_SUGGESTIONS["unsupported_command"])
-                    valid = False
-                    pos += 1
+            parse_body(func_name, body, variables)
             if not consume(TokenType.RBRACE):
                 log_error(f"Missing closing brace '}}' for function '{func_name}'", tokens[pos-1].line if pos > 0 else None, ERROR_SUGGESTIONS["missing_closing_brace"])
                 valid = False
@@ -641,9 +700,9 @@ def parse(tokens: List[Token]) -> Program:
 # ----------------- LLVM IR GENERATION -----------------
 @dataclass
 class LLVMContext:
-    var_map: Dict[str, Dict[str, Tuple[ir.Type, ir.AllocaInstr, bool]]]  # func -> var -> (type, alloca, is_final)
-    global_map: Dict[str, Tuple[ir.Type, ir.GlobalVariable, bool]]  # global var -> (type, global, is_final)
-    string_map: Dict[Tuple[str, str], ir.GlobalVariable]  # (func, string) -> global string
+    var_map: Dict[str, Dict[str, Tuple[ir.Type, ir.AllocaInstr, bool]]]
+    global_map: Dict[str, Tuple[ir.Type, ir.GlobalVariable, bool]]
+    string_map: Dict[Tuple[str, str], ir.GlobalVariable]
     reg_count: int
     builder: Optional[ir.IRBuilder]
 
@@ -690,10 +749,10 @@ def generate_llvm_ir(program: Program, ll_file: str):
         elif isinstance(expr, StringExpr):
             key = (func_name, expr.value)
             if key not in context.string_map:
-                escaped_str = expr.value + "\0"
-                str_type = ir.ArrayType(ir.IntType(8), len(escaped_str))
+                str_value = expr.value + "\0"
+                str_type = ir.ArrayType(ir.IntType(8), len(str_value))
                 str_global = ir.GlobalVariable(module, str_type, name=f".str.{len(context.string_map) + 1}")
-                str_global.initializer = ir.Constant(str_type, bytearray(escaped_str, "utf-8"))
+                str_global.initializer = ir.Constant(str_type, bytearray(str_value, "utf-8"))
                 str_global.linkage = "private"
                 str_global.global_constant = True
                 context.string_map[key] = str_global
@@ -719,7 +778,6 @@ def generate_llvm_ir(program: Program, ll_file: str):
                 log_error(f"Division by zero in expression", None, ERROR_SUGGESTIONS["division_by_zero"])
                 sys.exit(1)
             
-            # Handle type mismatch by casting to double if one operand is double
             result_type = left_type
             if left_type != right_type:
                 if isinstance(left_type, ir.IntType) and isinstance(right_type, ir.DoubleType):
@@ -745,7 +803,7 @@ def generate_llvm_ir(program: Program, ll_file: str):
         sys.exit(1)
 
     try:
-        # Declare globals (without initializers that depend on local variables)
+        # Declare globals
         for var_name, (var_type, expr, is_final) in program.globals.items():
             llvm_type = map_rock_to_llvm_type(var_type) if var_type != "final" else (ir.IntType(64) if isinstance(expr, NumberExpr) and expr.type == "i64" else ir.DoubleType())
             global_var = ir.GlobalVariable(module, llvm_type, name=var_name)
@@ -757,10 +815,10 @@ def generate_llvm_ir(program: Program, ll_file: str):
             elif isinstance(expr, StringExpr):
                 key = ("global", expr.value)
                 if key not in context.string_map:
-                    escaped_str = expr.value + "\0"
-                    str_type = ir.ArrayType(ir.IntType(8), len(escaped_str))
+                    str_value = expr.value + "\0"
+                    str_type = ir.ArrayType(ir.IntType(8), len(str_value))
                     str_global = ir.GlobalVariable(module, str_type, name=f".str.{len(context.string_map) + 1}")
-                    str_global.initializer = ir.Constant(str_type, bytearray(escaped_str, "utf-8"))
+                    str_global.initializer = ir.Constant(str_type, bytearray(str_value, "utf-8"))
                     str_global.linkage = "private"
                     str_global.global_constant = True
                     context.string_map[key] = str_global
@@ -784,115 +842,147 @@ def generate_llvm_ir(program: Program, ll_file: str):
         for func_name, func in program.functions.items():
             func_type = ir.FunctionType(ir.VoidType(), [])
             llvm_func = ir.Function(module, func_type, name=func_name)
+           
             entry_block = llvm_func.append_basic_block("entry")
             builder = ir.IRBuilder(entry_block)
             context.var_map[func_name] = {}
             context.builder = builder
 
-            for stmt in func.body:
-                if isinstance(stmt, GlobalVarDecl):
-                    expr_val, expr_type = process_expr(stmt.expr, func_name, builder)
-                    var_type, var_global, is_final = context.global_map[stmt.name]
-                    if stmt.is_final and isinstance(stmt.expr, VarExpr):
-                        src_type = program.globals.get(stmt.expr.name, (None, None, None))[0]
-                        if src_type not in ("int", "float"):
-                            log_error(f"Final global variable '{stmt.name}' must be initialized with an int or float variable", None, ERROR_SUGGESTIONS["invalid_final_initializer"])
-                            sys.exit(1)
-                        if src_type == "int" and var_type == ir.DoubleType():
-                            expr_val = builder.sitofp(expr_val, ir.DoubleType(), name=new_reg())
-                        elif src_type == "float" and var_type == ir.IntType(64):
-                            expr_val = builder.fptosi(expr_val, ir.IntType(64), name=new_reg())
-                    elif expr_type != var_type and not stmt.is_final:
-                        if isinstance(expr_type, ir.IntType) and var_type == ir.DoubleType():
-                            expr_val = builder.sitofp(expr_val, ir.DoubleType(), name=new_reg())
-                        elif isinstance(expr_type, ir.DoubleType) and var_type == ir.IntType(64):
-                            expr_val = builder.fptosi(expr_val, ir.IntType(64), name=new_reg())
-                        else:
-                            log_error(f"Type mismatch in global variable declaration '{stmt.name}'", None, ERROR_SUGGESTIONS["type_mismatch"])
-                            sys.exit(1)
-                    builder.store(expr_val, var_global)
-                elif isinstance(stmt, VarDecl):
-                    llvm_type = map_rock_to_llvm_type(stmt.type) if stmt.type != "final" else (ir.IntType(64) if isinstance(stmt.expr, NumberExpr) and stmt.expr.type == "i64" else ir.DoubleType())
-                    if stmt.is_final and isinstance(stmt.expr, VarExpr):
-                        src_type = context.var_map[func_name].get(stmt.expr.name, (None, None, None))[0] or context.global_map.get(stmt.expr.name, (None, None, None))[0]
-                        if src_type is None:
-                            log_error(f"Variable '{stmt.expr.name}' used but not defined in function '{func_name}'", None, ERROR_SUGGESTIONS["undefined_variable"])
-                            sys.exit(1)
-                        if src_type not in (ir.IntType(64), ir.DoubleType()):
-                            log_error(f"Final variable '{stmt.name}' must be initialized with an int or float variable", None, ERROR_SUGGESTIONS["invalid_final_initializer"])
-                            sys.exit(1)
-                        llvm_type = src_type
-                    var_alloca = builder.alloca(llvm_type, name=stmt.name)
-                    context.var_map[func_name][stmt.name] = (llvm_type, var_alloca, stmt.is_final)
-                    expr_val, expr_type = process_expr(stmt.expr, func_name, builder)
-                    if expr_type != llvm_type:
-                        if isinstance(expr_type, ir.IntType) and llvm_type == ir.DoubleType():
-                            expr_val = builder.sitofp(expr_val, ir.DoubleType(), name=new_reg())
-                        elif isinstance(expr_type, ir.DoubleType) and llvm_type == ir.IntType(64):
-                            expr_val = builder.fptosi(expr_val, ir.IntType(64), name=new_reg())
-                        else:
-                            log_error(f"Type mismatch in variable declaration '{stmt.name}'", None, ERROR_SUGGESTIONS["type_mismatch"])
-                            sys.exit(1)
-                    builder.store(expr_val, var_alloca)
-                elif isinstance(stmt, Assignment):
-                    expr_val, expr_type = process_expr(stmt.expr, func_name, builder)
-                    if stmt.name in context.var_map[func_name]:
-                        var_type, var_alloca, is_final = context.var_map[func_name][stmt.name]
-                        if is_final:
-                            log_error(f"Cannot assign to final variable '{stmt.name}' in function '{func_name}'", None, ERROR_SUGGESTIONS["immutable_assignment"])
-                            sys.exit(1)
-                        if expr_type != var_type:
-                            if isinstance(expr_type, ir.IntType) and var_type == ir.DoubleType():
-                                expr_val = builder.sitofp(expr_val, ir.DoubleType(), name=new_reg())
-                            elif isinstance(expr_type, ir.DoubleType) and var_type == ir.IntType(64):
-                                expr_val = builder.fptosi(expr_val, ir.IntType(64), name=new_reg())
-                            else:
-                                log_error(f"Type mismatch in assignment to local '{stmt.name}'", None, ERROR_SUGGESTIONS["type_mismatch"])
-                                sys.exit(1)
-                        builder.store(expr_val, var_alloca)
-                    elif stmt.name in context.global_map:
+            def process_body(stmts: List[ASTNode]):
+                for stmt in stmts:
+                    if isinstance(stmt, GlobalVarDecl):
+                        expr_val, expr_type = process_expr(stmt.expr, func_name, builder)
                         var_type, var_global, is_final = context.global_map[stmt.name]
-                        if is_final:
-                            log_error(f"Cannot assign to final global variable '{stmt.name}' in function '{func_name}'", None, ERROR_SUGGESTIONS["immutable_assignment"])
-                            sys.exit(1)
-                        if expr_type != var_type:
+                        if stmt.is_final and isinstance(stmt.expr, VarExpr):
+                            src_type = program.globals.get(stmt.expr.name, (None, None, None))[0]
+                            if src_type not in ("int", "float"):
+                                log_error(f"Final global variable '{stmt.name}' must be initialized with an int or float variable", None, ERROR_SUGGESTIONS["invalid_final_initializer"])
+                                sys.exit(1)
+                            if src_type == "int" and var_type == ir.DoubleType():
+                                expr_val = builder.sitofp(expr_val, ir.DoubleType(), name=new_reg())
+                            elif src_type == "float" and var_type == ir.IntType(64):
+                                expr_val = builder.fptosi(expr_val, ir.IntType(64), name=new_reg())
+                        elif expr_type != var_type and not stmt.is_final:
                             if isinstance(expr_type, ir.IntType) and var_type == ir.DoubleType():
                                 expr_val = builder.sitofp(expr_val, ir.DoubleType(), name=new_reg())
                             elif isinstance(expr_type, ir.DoubleType) and var_type == ir.IntType(64):
                                 expr_val = builder.fptosi(expr_val, ir.IntType(64), name=new_reg())
                             else:
-                                log_error(f"Type mismatch in assignment to global '{stmt.name}'", None, ERROR_SUGGESTIONS["type_mismatch"])
+                                log_error(f"Type mismatch in global variable declaration '{stmt.name}'", None, ERROR_SUGGESTIONS["type_mismatch"])
                                 sys.exit(1)
                         builder.store(expr_val, var_global)
-                    else:
-                        log_error(f"Assignment to undefined variable '{stmt.name}'", None, ERROR_SUGGESTIONS["invalid_assignment"])
-                        sys.exit(1)
-                elif isinstance(stmt, Stdout):
-                    expr_val, expr_type = process_expr(stmt.expr, func_name, builder)
-                    if isinstance(expr_type, (ir.IntType, ir.DoubleType)):
-                        var_name = stmt.expr.name if isinstance(stmt.expr, VarExpr) else None
-                        is_final = context.var_map[func_name].get(var_name, (None, None, False))[2] or context.global_map.get(var_name, (None, None, False))[2] if var_name else False
-                        if not is_final:
-                            log_error(f"Stdout can't print int or float directly in function '{func_name}'", None, ERROR_SUGGESTIONS["stdout_type_error"])
+                    elif isinstance(stmt, VarDecl):
+                        llvm_type = map_rock_to_llvm_type(stmt.type) if stmt.type != "final" else (ir.IntType(64) if isinstance(stmt.expr, NumberExpr) and stmt.expr.type == "i64" else ir.DoubleType())
+                        if stmt.is_final and isinstance(stmt.expr, VarExpr):
+                            src_type = context.var_map[func_name].get(stmt.expr.name, (None, None, None))[0] or context.global_map.get(stmt.expr.name, (None, None, None))[0]
+                            if src_type is None:
+                                log_error(f"Variable '{stmt.expr.name}' used but not defined in function '{func_name}'", None, ERROR_SUGGESTIONS["undefined_variable"])
+                                sys.exit(1)
+                            if src_type not in (ir.IntType(64), ir.DoubleType()):
+                                log_error(f"Final variable '{stmt.name}' must be initialized with an int or float variable", None, ERROR_SUGGESTIONS["invalid_final_initializer"])
+                                sys.exit(1)
+                            llvm_type = src_type
+                        var_alloca = builder.alloca(llvm_type, name=stmt.name)
+                        context.var_map[func_name][stmt.name] = (llvm_type, var_alloca, stmt.is_final)
+                        expr_val, expr_type = process_expr(stmt.expr, func_name, builder)
+                        if expr_type != llvm_type:
+                            if isinstance(expr_type, ir.IntType) and llvm_type == ir.DoubleType():
+                                expr_val = builder.sitofp(expr_val, ir.DoubleType(), name=new_reg())
+                            elif isinstance(expr_type, ir.DoubleType) and llvm_type == ir.IntType(64):
+                                expr_val = builder.fptosi(expr_val, ir.IntType(64), name=new_reg())
+                            else:
+                                log_error(f"Type mismatch in variable declaration '{stmt.name}'", None, ERROR_SUGGESTIONS["type_mismatch"])
+                                sys.exit(1)
+                        builder.store(expr_val, var_alloca)
+                    elif isinstance(stmt, Assignment):
+                        expr_val, expr_type = process_expr(stmt.expr, func_name, builder)
+                        if stmt.name in context.var_map[func_name]:
+                            var_type, var_alloca, is_final = context.var_map[func_name][stmt.name]
+                            if is_final:
+                                log_error(f"Cannot assign to final variable '{stmt.name}' in function '{func_name}'", None, ERROR_SUGGESTIONS["immutable_assignment"])
+                                sys.exit(1)
+                            if expr_type != var_type:
+                                if isinstance(expr_type, ir.IntType) and var_type == ir.DoubleType():
+                                    expr_val = builder.sitofp(expr_val, ir.DoubleType(), name=new_reg())
+                                elif isinstance(expr_type, ir.DoubleType) and var_type == ir.IntType(64):
+                                    expr_val = builder.fptosi(expr_val, ir.IntType(64), name=new_reg())
+                                else:
+                                    log_error(f"Type mismatch in assignment to local '{stmt.name}'", None, ERROR_SUGGESTIONS["type_mismatch"])
+                                    sys.exit(1)
+                            builder.store(expr_val, var_alloca)
+                        elif stmt.name in context.global_map:
+                            var_type, var_global, is_final = context.global_map[stmt.name]
+                            if is_final:
+                                log_error(f"Cannot assign to final global variable '{stmt.name}' in function '{func_name}'", None, ERROR_SUGGESTIONS["immutable_assignment"])
+                                sys.exit(1)
+                            if expr_type != var_type:
+                                if isinstance(expr_type, ir.IntType) and var_type == ir.DoubleType():
+                                    expr_val = builder.sitofp(expr_val, ir.DoubleType(), name=new_reg())
+                                elif isinstance(expr_type, ir.DoubleType) and var_type == ir.IntType(64):
+                                    expr_val = builder.fptosi(expr_val, ir.IntType(64), name=new_reg())
+                                else:
+                                    log_error(f"Type mismatch in assignment to global '{stmt.name}'", None, ERROR_SUGGESTIONS["type_mismatch"])
+                                    sys.exit(1)
+                            builder.store(expr_val, var_global)
+                        else:
+                            log_error(f"Assignment to undefined variable '{stmt.name}'", None, ERROR_SUGGESTIONS["invalid_assignment"])
                             sys.exit(1)
-                    if isinstance(expr_type, ir.IntType):
-                        fmt_ptr = builder.gep(str_int, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)])
-                        builder.call(printf, [fmt_ptr, expr_val])
-                    elif isinstance(expr_type, ir.DoubleType):
-                        fmt_ptr = builder.gep(str_double, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)])
-                        builder.call(printf, [fmt_ptr, expr_val])
-                    elif isinstance(expr_type, ir.PointerType):
-                        fmt_ptr = builder.gep(str_no_newline, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)])
-                        builder.call(printf, [fmt_ptr, expr_val])
-                    else:
-                        log_error(f"Unsupported type '{expr_type}' for stdout", None, ERROR_SUGGESTIONS["type_mismatch"])
-                        sys.exit(1)
-                elif isinstance(stmt, Call):
-                    if stmt.func_name not in program.functions:
-                        log_error(f"Calling undefined function '{stmt.func_name}'", None, ERROR_SUGGESTIONS["invoking_undefined_function"])
-                        sys.exit(1)
-                    called_func = module.get_global(stmt.func_name)
-                    builder.call(called_func, [])
+                    elif isinstance(stmt, Stdout):
+                        expr_val, expr_type = process_expr(stmt.expr, func_name, builder)
+                        if isinstance(expr_type, (ir.IntType, ir.DoubleType)):
+                            var_name = stmt.expr.name if isinstance(stmt.expr, VarExpr) else None
+                            is_final = context.var_map[func_name].get(var_name, (None, None, False))[2] or context.global_map.get(var_name, (None, None, False))[2] if var_name else False
+                            if not is_final:
+                                log_error(f"Stdout can't print int or float directly in function '{func_name}'", None, ERROR_SUGGESTIONS["stdout_type_error"])
+                                sys.exit(1)
+                        if isinstance(expr_type, ir.IntType):
+                            fmt_ptr = builder.gep(str_int, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)])
+                            builder.call(printf, [fmt_ptr, expr_val])
+                        elif isinstance(expr_type, ir.DoubleType):
+                            fmt_ptr = builder.gep(str_double, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)])
+                            builder.call(printf, [fmt_ptr, expr_val])
+                        elif isinstance(expr_type, ir.PointerType):
+                            fmt_ptr = builder.gep(str_no_newline, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)])
+                            builder.call(printf, [fmt_ptr, expr_val])
+                        else:
+                            log_error(f"Unsupported type '{expr_type}' for stdout", None, ERROR_SUGGESTIONS["type_mismatch"])
+                            sys.exit(1)
+                    elif isinstance(stmt, Call):
+                        if stmt.func_name not in program.functions:
+                            log_error(f"Calling undefined function '{stmt.func_name}'", None, ERROR_SUGGESTIONS["invoking_undefined_function"])
+                            sys.exit(1)
+                        called_func = module.get_global(stmt.func_name)
+                        builder.call(called_func, [])
+                    elif isinstance(stmt, UntilLoop):
+                        loop_start = llvm_func.append_basic_block(f"loop_start_{stmt.condition.name if isinstance(stmt.condition, VarExpr) else 'expr'}")
+                        loop_body = llvm_func.append_basic_block(f"loop_body_{stmt.condition.name if isinstance(stmt.condition, VarExpr) else 'expr'}")
+                        loop_end = llvm_func.append_basic_block(f"loop_end_{stmt.condition.name if isinstance(stmt.condition, VarExpr) else 'expr'}")
+                        builder.branch(loop_start)
+                        builder.position_at_end(loop_start)
+                        cond_val, cond_type = process_expr(stmt.condition, func_name, builder)
+                        if not isinstance(cond_type, ir.IntType):
+                            log_error(f"Until loop condition must be an integer type, got '{cond_type}'", None, ERROR_SUGGESTIONS["invalid_until_condition"])
+                            sys.exit(1)
+                        zero = ir.Constant(ir.IntType(64), 0)
+                        cond = builder.icmp_signed('!=', cond_val, zero, name=new_reg())
+                        builder.cbranch(cond, loop_body, loop_end)
+                        builder.position_at_end(loop_body)
+                        process_body(stmt.body)
+                        if isinstance(stmt.condition, VarExpr):
+                            var_type, var_alloca, is_final = context.var_map[func_name].get(stmt.condition.name, (None, None, False)) or context.global_map.get(stmt.condition.name, (None, None, False))
+                            if var_type is None:
+                                log_error(f"Variable '{stmt.condition.name}' not defined in until loop", None, ERROR_SUGGESTIONS["undefined_variable"])
+                                sys.exit(1)
+                            if is_final:
+                                log_error(f"Cannot modify final variable '{stmt.condition.name}' in until loop", None, ERROR_SUGGESTIONS["immutable_assignment"])
+                                sys.exit(1)
+                            current_val = builder.load(var_alloca, name=new_reg())
+                            decremented = builder.sub(current_val, ir.Constant(ir.IntType(64), 1), name=new_reg())
+                            builder.store(decremented, var_alloca)
+                        builder.branch(loop_start)
+                        builder.position_at_end(loop_end)
+
+            process_body(func.body)
             builder.ret_void()
 
         # Main function
@@ -921,14 +1011,15 @@ def generate_llvm_ir(program: Program, ll_file: str):
         sys.exit(1)
 
 # ----------------- COMPILE LLVM TO EXE -----------------
+
+
 def compile_llvm_to_exe(ll_file: str, exe_name: str):
     log_info(f"Compiling LLVM IR to executable: {exe_name}")
     exe_file = os.path.join(os.getcwd(), exe_name)
-    obj_file = os.path.splitext(exe_file)[0] + ".o"
     try:
-        result = subprocess.run([CLANG_PATH, "-c", ll_file, "-o", obj_file], capture_output=True, text=True, check=True)
-        log_info(f"Object file created: {obj_file}")
-        result = subprocess.run([GCC_PATH, obj_file, "-o", exe_file], capture_output=True, text=True, check=True)
+        # Direct Clang compile+link with MinGW target (GCC-friendly)
+        cmd = [CLANG_PATH, ll_file, "-o", exe_file, "-target", "x86_64-w64-mingw32", "-fuse-ld=lld"]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         log_info(f"Executable created successfully: {exe_file}")
     except subprocess.CalledProcessError as e:
         log_error(f"Compilation failed: {e.stderr}")
@@ -943,12 +1034,6 @@ def compile_llvm_to_exe(ll_file: str, exe_name: str):
                 log_info(f"Temporary LLVM IR file removed: {ll_file}")
             except Exception as e:
                 log_warning(f"Could not remove temporary LLVM IR file {ll_file}: {str(e)}")
-        if os.path.exists(obj_file):
-            try:
-                os.remove(obj_file)
-                log_info(f"Temporary object file removed: {obj_file}")
-            except Exception as e:
-                log_warning(f"Could not remove temporary object file {obj_file}: {str(e)}")
 
 # ----------------- COMPILATION -----------------
 def rock_to_llvm(rock_file: str) -> str:
