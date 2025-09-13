@@ -1013,12 +1013,29 @@ def generate_llvm_ir(program: Program, ll_file: str):
 # ----------------- COMPILE LLVM TO EXE -----------------
 
 
+
 def compile_llvm_to_exe(ll_file: str, exe_name: str):
     log_info(f"Compiling LLVM IR to executable: {exe_name}")
     exe_file = os.path.join(os.getcwd(), exe_name)
+    
+    # Add GCC_PATH's directory to PATH for library discovery
+    gcc_dir = os.path.dirname(GCC_PATH)  # e.g., C:\mingw64\bin
+    current_path = os.environ.get("PATH", "")
+    new_path = f"{gcc_dir}{os.pathsep}{current_path}"
+    os.environ["PATH"] = new_path  # Update PATH for this process
+    
     try:
-        # Direct Clang compile+link with MinGW target (GCC-friendly)
-        cmd = [CLANG_PATH, ll_file, "-o", exe_file, "-target", "x86_64-w64-mingw32", "-fuse-ld=lld"]
+        # Clang command with MinGW target and runtime libraries
+        cmd = [
+            CLANG_PATH, ll_file,
+            "-o", exe_file,
+            "-target", "x86_64-w64-mingw32",
+            "-fuse-ld=lld",
+            # Explicit MinGW runtime libraries (required by LLD)
+            "-lmingw32", "-lgcc", "-lgcc_eh", "-lmingwex", "-lmsvcrt",
+            "-ladvapi32", "-lshell32", "-luser32", "-lkernel32",
+            "-g", "-O0"  # Debug info, no optimization
+        ]
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         log_info(f"Executable created successfully: {exe_file}")
     except subprocess.CalledProcessError as e:
