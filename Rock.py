@@ -1,4 +1,3 @@
-
 import shutil
 import os
 import sys
@@ -24,7 +23,7 @@ GCC_PATH = "C:\\mingw64\\mingw64\\bin\\gcc.exe"
 
 # Reserved keywords
 RESERVED_KEYWORDS = {
-    "define", "global", "final", "invoke", "int", "float", "string",
+    "define", "global", "final", "invoke", "call", "int", "float", "string",
     "stdout", "stdoutf", "until", "if", "ifelse", "else"
 }
 
@@ -63,7 +62,7 @@ ERROR_SUGGESTIONS = {
     "invalid_variable_definition": "Use correct variable syntax, e.g., 'int var = expression;'.",
     "undefined_variable": "Declare the variable before using it, e.g., 'int var = value;' or 'global type var = value;'.",
     "division_by_zero": "The denominator in a division cannot be zero. Add a check to avoid this.",
-    "unsupported_command": "Use only valid Rock language commands (int, float, string, final, stdout, stdoutf, global, until, if, ifelse, else, etc.).",
+    "unsupported_command": "Use only valid Rock language commands (int, float, string, final, stdout, stdoutf, global, until, if, ifelse, else, call).",
     "missing_closing_brace": "Add a closing '}' to complete the function, loop, or if statement definition.",
     "invalid_expression": "Check the expression for correct syntax and valid variable names.",
     "invalid_character": "Use only valid characters in the Rock language syntax.",
@@ -83,7 +82,9 @@ ERROR_SUGGESTIONS = {
     "stdout_parentheses_error": "Stdout expressions must not be enclosed in parentheses. Use 'stdout \"string\";' or 'stdout var;'.",
     "reserved_keyword": "Cannot use reserved keywords as variable or function names.",
     "unused_variable": "Consider using or removing the variable to optimize the code.",
-    "recursive_call": "Add a base case or limit recursion depth to prevent stack overflow."
+    "recursive_call": "Add a base case or limit recursion depth to prevent stack overflow.",
+    "invalid_call_usage": "The 'call' keyword can only be used within a function body to call another function.",
+    "invalid_invoke_usage": "The 'invoke' keyword can only be used at the top level to call a function as the program entry point."
 }
 
 # ----------------- TOKENIZATION -----------------
@@ -101,6 +102,7 @@ class TokenType(Enum):
     LBRACE = "LBRACE"
     RBRACE = "RBRACE"
     INVOKE = "INVOKE"
+    CALL = "CALL"
     INT = "INT"
     FLOAT = "FLOAT"
     STRING = "STRING"
@@ -723,18 +725,29 @@ def parse(tokens: List[Token]) -> Program:
                 body.append(StdoutF(format_string, args))
                 if not consume(TokenType.SEMICOLON):
                     continue
-            elif tokens[pos].type == TokenType.IDENTIFIER and pos + 1 < len(tokens) and tokens[pos + 1].type == TokenType.LPAREN:
-                func_name_call = tokens[pos].value
-                pos += 2
-                if not consume(TokenType.RPAREN):
+            elif tokens[pos].type == TokenType.CALL:
+                pos += 1
+                func_token = consume(TokenType.IDENTIFIER)
+                if not func_token:
                     continue
+                func_name_call = func_token.value
+                # Handle optional parentheses
+                if pos < len(tokens) and tokens[pos].type == TokenType.LPAREN:
+                    pos += 1
+                    if not consume(TokenType.RPAREN):
+                        continue
                 if func_name_call not in functions and func_name_call != func_name:
-                    log_error(f"Calling undefined function '{func_name_call}' in function '{func_name}'", tokens[pos-2].line, ERROR_SUGGESTIONS["invoking_undefined_function"], "UNDEFINED_FUNC")
+                    log_error(f"Calling undefined function '{func_name_call}' in function '{func_name}'", func_token.line, ERROR_SUGGESTIONS["invoking_undefined_function"], "UNDEFINED_FUNC")
                     valid = False
                 check_recursion(Call(func_name_call), func_name, set())
                 body.append(Call(func_name_call))
                 if not consume(TokenType.SEMICOLON):
                     continue
+            elif tokens[pos].type == TokenType.INVOKE:
+                log_error(f"The 'invoke' keyword cannot be used inside function '{func_name}'", tokens[pos].line, ERROR_SUGGESTIONS["invalid_invoke_usage"], "INVALID_INVOKE_USAGE")
+                valid = False
+                pos += 1
+                continue
             elif tokens[pos].type == TokenType.UNTIL:
                 pos += 1
                 if not consume(TokenType.LPAREN):
@@ -887,6 +900,11 @@ def parse(tokens: List[Token]) -> Program:
                     invokes.append(invoke_name)
             if not consume(TokenType.SEMICOLON):
                 continue
+        elif token.type == TokenType.CALL:
+            log_error(f"The 'call' keyword cannot be used at the top level", token.line, ERROR_SUGGESTIONS["invalid_call_usage"], "INVALID_CALL_USAGE")
+            valid = False
+            pos += 1
+            continue
         else:
             log_error(f"Unexpected token '{token.value}'", token.line, ERROR_SUGGESTIONS["unexpected_token"], "UNEXPECTED_TOKEN")
             valid = False
@@ -955,10 +973,11 @@ def generate_llvm_ir(program: Program, ll_file: str):
         elif isinstance(expr, StringExpr):
             key = (func_name, expr.value)
             if key not in context.string_map:
-                str_value = expr.value + "\0"
-                str_type = ir.ArrayType(ir.IntType(8), len(str_value))
+                # Encode the string to UTF-8 and get the bytearray
+                str_bytes = bytearray(expr.value.encode('utf-8')) + b"\0"
+                str_type = ir.ArrayType(ir.IntType(8), len(str_bytes))
                 str_global = ir.GlobalVariable(module, str_type, name=f".str.{len(context.string_map) + 1}")
-                str_global.initializer = ir.Constant(str_type, bytearray(str_value, "utf-8"))
+                str_global.initializer = ir.Constant(str_type, str_bytes)
                 str_global.linkage = "private"
                 str_global.global_constant = True
                 context.string_map[key] = str_global
@@ -1039,14 +1058,14 @@ def generate_llvm_ir(program: Program, ll_file: str):
             elif isinstance(expr, StringExpr):
                 key = ("global", expr.value)
                 if key not in context.string_map:
-                    str_value = expr.value + "\0"
-                    str_type = ir.ArrayType(ir.IntType(8), len(str_value))
+                    str_bytes = bytearray(expr.value.encode('utf-8')) + b"\0"
+                    str_type = ir.ArrayType(ir.IntType(8), len(str_bytes))
                     str_global = ir.GlobalVariable(module, str_type, name=f".str.{len(context.string_map) + 1}")
-                    str_global.initializer = ir.Constant(str_type, bytearray(str_value, "utf-8"))
+                    str_global.initializer = ir.Constant(str_type, str_bytes)
                     str_global.linkage = "private"
                     str_global.global_constant = True
                     context.string_map[key] = str_global
-                global_var.initializer = ir.Constant(ir.PointerType(ir.IntType(8)), context.string_map[key])
+                global_var.initializer = builder.gep(context.string_map[key], [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)])
             elif isinstance(expr, VarExpr):
                 if expr.name in program.globals:
                     src_type, _, _ = program.globals[expr.name]
@@ -1201,10 +1220,10 @@ def generate_llvm_ir(program: Program, ll_file: str):
                             format_args.append(arg_val)
                         key = (func_name, llvm_format_string)
                         if key not in context.string_map:
-                            str_value = llvm_format_string + "\0"
-                            str_type = ir.ArrayType(ir.IntType(8), len(str_value))
+                            str_bytes = bytearray(llvm_format_string.encode('utf-8')) + b"\0"
+                            str_type = ir.ArrayType(ir.IntType(8), len(str_bytes))
                             str_global = ir.GlobalVariable(module, str_type, name=f".str.fmt.{len(context.string_map) + 1}")
-                            str_global.initializer = ir.Constant(str_type, bytearray(str_value, "utf-8"))
+                            str_global.initializer = ir.Constant(str_type, str_bytes)
                             str_global.linkage = "private"
                             str_global.global_constant = True
                             context.string_map[key] = str_global
@@ -1255,7 +1274,7 @@ def generate_llvm_ir(program: Program, ll_file: str):
                         elif isinstance(cond_type, ir.IntType) and cond_type.width == 1:
                             cond = cond_val
                         else:
-                            log_error(f"If condition must be an integer or comparison type, got '{cond_type}'", None, ERROR_SUGGESTIONS["invalid_if_condition"], "INVALID_IF_COND")
+                            log_error(f"If condition must evaluate to an integer or boolean type, got '{cond_type}'", None, ERROR_SUGGESTIONS["invalid_if_condition"], "INVALID_IF_COND")
                             sys.exit(1)
                         if stmt.else_body:
                             builder.cbranch(cond, then_block, else_block)
@@ -1273,24 +1292,23 @@ def generate_llvm_ir(program: Program, ll_file: str):
             process_body(func.body)
             builder.ret_void()
 
-        # Main function
+        # Generate main function
         main_type = ir.FunctionType(ir.IntType(32), [])
         main_func = ir.Function(module, main_type, name="main")
-        main_block = main_func.append_basic_block("entry")
-        builder = ir.IRBuilder(main_block)
-        context.var_map["main"] = {}
+        entry_block = main_func.append_basic_block("entry")
+        builder = ir.IRBuilder(entry_block)
+        context.builder = builder
 
         for invoke_name in program.invoke:
-            if invoke_name in program.functions:
-                called_func = module.get_global(invoke_name)
-                builder.call(called_func, [])
-            else:
-                log_error(f"Invoking undefined function '{invoke_name}'", None, ERROR_SUGGESTIONS["invoking_undefined_function"], "UNDEFINED_FUNC")
+            if invoke_name not in program.functions:
+                log_error(f"Invoking undefined function '{invoke_name}' in main", None, ERROR_SUGGESTIONS["invoking_undefined_function"], "UNDEFINED_FUNC")
                 sys.exit(1)
+            called_func = module.get_global(invoke_name)
+            builder.call(called_func, [])
 
         builder.ret(ir.Constant(ir.IntType(32), 0))
 
-        # Write LLVM IR to file
+         # Write LLVM IR to file
         with open (ll_file, "w", encoding="utf-8") as f:
             f.write(str(module))
         log_info("LLVM IR generation completed")
